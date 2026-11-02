@@ -1,0 +1,955 @@
+"""
+Notification templates. Provides reusable event presets for quick setup.
+"""
+import discord
+from discord.ext import commands
+import sqlite3
+import json
+import os
+import logging
+from typing import Optional, Dict, List
+
+# Import event type configuration
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from notification_event_types import (
+    EVENT_CONFIG, get_event_icon, get_event_config, get_instance_display_name,
+    get_instance_defaults, get_instance_labels
+)
+from .pimp_my_bot import theme, menu_timeout, confirm_timeout
+from .permission_handler import PermissionManager
+
+logger = logging.getLogger('notification')
+
+
+def build_instance_template_name(event_type: str, instance_id: str) -> str:
+    """Template row name for a sub-event, e.g. 'SvS - Battle Start'"""
+    return f"{event_type} - {get_instance_display_name(event_type, instance_id) or instance_id}"
+
+
+def build_default_embed_title(config: Dict) -> str:
+    """Title format, including the time placeholder when the event has variable times"""
+    has_variable_times = (
+        config.get("available_times") or
+        config.get("time_slots") or
+        config.get("instances_per_cycle", 0) > 1
+    )
+    return "%i %e %n" if has_variable_times else "%i %n"
+
+
+def build_default_repeat_config(event_name: str, config: Dict) -> str:
+    """JSON repeat settings derived from the event's schedule type"""
+    schedule_type = config.get("schedule_type")
+
+    if schedule_type == "daily":
+        repeat_config = {"type": "interval", "minutes": 1440}
+    elif schedule_type == "global_weekly":
+        repeat_config = {"type": "fixed_days", "days": [4]}
+    elif schedule_type == "global_biweekly":
+        if event_name == "Crazy Joe":
+            repeat_config = {"type": "custom"}
+        else:
+            repeat_config = {"type": "interval", "minutes": 20160}
+    elif schedule_type in ["global_monthly", "global_4weekly", "global_4weekly_alt"]:
+        repeat_config = {"type": "interval", "minutes": 40320}
+    else:
+        repeat_config = {"type": "custom"}
+
+    return json.dumps(repeat_config)
+
+
+class NotificationTemplates(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.db_path = 'db/beartime.sqlite'
+        os.makedirs('db', exist_ok=True)
+
+        self.conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+
+        # Enable WAL mode
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.commit()
+
+        self._setup_database()
+
+    def _setup_database(self):
+        """Create the templates table, run migrations, then seed and sync default rows"""
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notification_templates (
+                template_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_name TEXT NOT NULL,
+                event_type TEXT,
+                description TEXT,
+                notification_type INTEGER,
+                default_times TEXT,
+                embed_title TEXT,
+                embed_description TEXT,
+                embed_color TEXT,
+                embed_image_url TEXT,
+                embed_thumbnail_url TEXT,
+                repeat_config TEXT,
+                is_global INTEGER DEFAULT 1,
+                created_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.commit()
+
+        # Migrate: Add mention_message, footer, and author columns if they don't exist
+        self._migrate_add_embed_text_fields()
+
+        # Migrate: Add instance_identifier column for sub-event template rows
+        self._migrate_add_instance_identifier()
+
+        # Populate pre-built templates if none exist
+        self.cursor.execute("SELECT COUNT(*) FROM notification_templates WHERE is_global = 1")
+        if self.cursor.fetchone()[0] == 0:
+            self._populate_default_templates()
+
+        # Seed one row per sub-event, including on installs that already have templates
+        self._ensure_instance_templates()
+
+        # Always sync non-customized templates with latest defaults from notification_event_types.py
+        self._sync_default_templates()
+
+    async def cog_unload(self):
+        """Close database connections when cog is unloaded."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def _migrate_add_embed_text_fields(self):
+        """Add mention_message, footer, and author columns if they don't exist"""
+        self.cursor.execute("PRAGMA table_info(notification_templates)")
+        columns = [column[1] for column in self.cursor.fetchall()]
+
+        if 'mention_message' not in columns:
+            self.cursor.execute("ALTER TABLE notification_templates ADD COLUMN mention_message TEXT")
+            self.cursor.execute("ALTER TABLE notification_templates ADD COLUMN footer TEXT")
+            self.cursor.execute("ALTER TABLE notification_templates ADD COLUMN author TEXT")
+            self.conn.commit()
+
+    def _migrate_add_instance_identifier(self):
+        """Add the instance_identifier column that marks a row as one event's sub-event"""
+        self.cursor.execute("PRAGMA table_info(notification_templates)")
+        columns = [column[1] for column in self.cursor.fetchall()]
+
+        if 'instance_identifier' not in columns:
+            self.cursor.execute("ALTER TABLE notification_templates ADD COLUMN instance_identifier TEXT")
+            self.conn.commit()
+            logger.info("Added instance_identifier column to notification_templates")
+            print("Added instance_identifier column to notification_templates")
+
+    def _ensure_instance_templates(self):
+        """Create one editable template row per sub-event, skipping any that already exist"""
+        created = 0
+
+        for event_name, config in EVENT_CONFIG.items():
+            embed_title = build_default_embed_title(config)
+            repeat_config = build_default_repeat_config(event_name, config)
+
+            for instance_id, description in get_instance_defaults(event_name).items():
+                self.cursor.execute("""
+                    INSERT INTO notification_templates
+                    (template_name, event_type, instance_identifier, description, notification_type,
+                     embed_title, embed_description, embed_color, embed_image_url,
+                     embed_thumbnail_url, repeat_config, is_global, created_by)
+                    SELECT ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 1, NULL
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM notification_templates
+                        WHERE event_type = ? AND instance_identifier = ?
+                    )
+                """, (
+                    build_instance_template_name(event_name, instance_id),
+                    event_name,
+                    instance_id,
+                    config.get("default_notification_type", 1),
+                    embed_title,
+                    description,
+                    "3447003",
+                    config.get("image_url", ""),
+                    config.get("thumbnail_url", ""),
+                    repeat_config,
+                    event_name,
+                    instance_id
+                ))
+                created += self.cursor.rowcount
+
+        self.conn.commit()
+
+        if created:
+            logger.info(f"Created {created} sub-event notification templates")
+            print(f"Created {created} sub-event notification templates")
+
+    def _sync_default_templates(self):
+        """Sync non-customized templates with latest values from notification_event_types.py"""
+        # First, handle any renamed events (old_name -> new_name)
+        renamed_events = {
+            "Mercenary Bosses": "Mercenary Prestige",
+        }
+        for old_name, new_name in renamed_events.items():
+            # Update templates table
+            self.cursor.execute("""
+                UPDATE notification_templates
+                SET event_type = ?, template_name = ?
+                WHERE event_type = ?
+            """, (new_name, new_name, old_name))
+            # Also update bear_notifications table
+            self.cursor.execute("""
+                UPDATE bear_notifications
+                SET event_type = ?
+                WHERE event_type = ?
+            """, (new_name, old_name))
+
+        # Now sync values from EVENT_CONFIG
+        for event_name, config in EVENT_CONFIG.items():
+            image_url = config.get("image_url", "")
+            thumbnail_url = config.get("thumbnail_url", "")
+            description = config.get("description", "")
+            repeat_config = build_default_repeat_config(event_name, config)
+
+            # Only update templates that haven't been customized (is_global = 1)
+            self.cursor.execute("""
+                UPDATE notification_templates
+                SET embed_image_url = ?, embed_thumbnail_url = ?, embed_description = ?,
+                    repeat_config = ?
+                WHERE event_type = ? AND is_global = 1 AND instance_identifier IS NULL
+            """, (image_url, thumbnail_url, description, repeat_config, event_name))
+
+            # Sub-event rows keep their own default wording
+            for instance_id, instance_description in get_instance_defaults(event_name).items():
+                self.cursor.execute("""
+                    UPDATE notification_templates
+                    SET embed_image_url = ?, embed_thumbnail_url = ?, embed_description = ?,
+                        repeat_config = ?
+                    WHERE event_type = ? AND is_global = 1 AND instance_identifier = ?
+                """, (image_url, thumbnail_url, instance_description, repeat_config,
+                      event_name, instance_id))
+
+        self.conn.commit()
+
+    def _populate_default_templates(self):
+        """Populate database with pre-built templates for all event types"""
+        templates = []
+
+        for event_name, config in EVENT_CONFIG.items():
+            description = config.get("description", "")
+            image_url = config.get("image_url", "")
+            thumbnail_url = config.get("thumbnail_url", "")
+            notification_type = config.get("default_notification_type", 1)
+
+            templates.append({
+                "template_name": event_name,
+                "event_type": event_name,
+                "description": "",  # Will be generated dynamically when displaying
+                "notification_type": notification_type,
+                "embed_title": build_default_embed_title(config),
+                "embed_description": description,
+                "embed_color": "3447003",  # Discord blue
+                "embed_image_url": image_url,
+                "embed_thumbnail_url": thumbnail_url,
+                "repeat_config": build_default_repeat_config(event_name, config),
+                "is_global": 1,
+                "created_by": None
+            })
+
+        # Insert all templates
+        for template in templates:
+            self.cursor.execute("""
+                INSERT INTO notification_templates
+                (template_name, event_type, description, notification_type, embed_title,
+                 embed_description, embed_color, embed_image_url, embed_thumbnail_url,
+                 repeat_config, is_global, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                template["template_name"],
+                template["event_type"],
+                template["description"],
+                template["notification_type"],
+                template["embed_title"],
+                template["embed_description"],
+                template["embed_color"],
+                template["embed_image_url"],
+                template["embed_thumbnail_url"],
+                template["repeat_config"],
+                template["is_global"],
+                template["created_by"]
+            ))
+
+        self.conn.commit()
+
+    async def check_admin(self, interaction: discord.Interaction) -> bool:
+        """Check if user is an admin"""
+        is_admin, _ = PermissionManager.is_admin(interaction.user.id)
+        if not is_admin:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} You don't have permission to use this command!",
+                ephemeral=True
+            )
+        return is_admin
+
+    def get_template(self, template_id: int) -> Optional[Dict]:
+        """Get a template by ID"""
+        self.cursor.execute("""
+            SELECT template_id, template_name, event_type, description, notification_type,
+                   default_times, embed_title, embed_description, embed_color,
+                   embed_image_url, embed_thumbnail_url, repeat_config, is_global, created_by,
+                   mention_message, footer, author, instance_identifier
+            FROM notification_templates
+            WHERE template_id = ?
+        """, (template_id,))
+
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+
+        return {
+            "template_id": row[0],
+            "template_name": row[1],
+            "event_type": row[2],
+            "description": row[3],
+            "notification_type": row[4],
+            "default_times": row[5],
+            "embed_title": row[6],
+            "embed_description": row[7],
+            "embed_color": row[8],
+            "embed_image_url": row[9],
+            "embed_thumbnail_url": row[10],
+            "repeat_config": row[11],
+            "is_global": row[12],
+            "created_by": row[13],
+            "mention_message": row[14],
+            "footer": row[15],
+            "author": row[16],
+            "instance_identifier": row[17]
+        }
+
+    def get_event_template(self, event_type: str, instance_identifier: Optional[str] = None) -> Optional[Dict]:
+        """Get an event's own template row, or the row for one of its sub-events"""
+        if instance_identifier:
+            self.cursor.execute("""
+                SELECT template_id FROM notification_templates
+                WHERE event_type = ? AND instance_identifier = ?
+            """, (event_type, instance_identifier))
+        else:
+            self.cursor.execute("""
+                SELECT template_id FROM notification_templates
+                WHERE event_type = ? AND instance_identifier IS NULL
+                ORDER BY template_id ASC
+            """, (event_type,))
+
+        row = self.cursor.fetchone()
+        return self.get_template(row[0]) if row else None
+
+    def apply_description_to_instances(self, event_type: str, embed_description: str,
+                                       user_id: int = None) -> int:
+        """Copy one description onto every sub-event template of an event, returning the row count"""
+        self.cursor.execute("""
+            UPDATE notification_templates
+            SET embed_description = ?, is_global = 0, created_by = COALESCE(created_by, ?)
+            WHERE event_type = ? AND instance_identifier IS NOT NULL
+        """, (embed_description, user_id, event_type))
+        updated = self.cursor.rowcount
+        self.conn.commit()
+        return updated
+
+    def update_template(self, template_id: int, embed_title: str, embed_description: str,
+                       embed_image_url: str, embed_thumbnail_url: str, mention_message: str = None,
+                       footer: str = None, author: str = None, user_id: int = None):
+        """Update a template's embed settings"""
+        self.cursor.execute("""
+            UPDATE notification_templates
+            SET embed_title = ?, embed_description = ?, embed_image_url = ?, embed_thumbnail_url = ?,
+                mention_message = ?, footer = ?, author = ?,
+                is_global = 0, created_by = COALESCE(created_by, ?)
+            WHERE template_id = ?
+        """, (embed_title, embed_description, embed_image_url, embed_thumbnail_url,
+              mention_message, footer, author, user_id, template_id))
+        self.conn.commit()
+
+    def reset_template_to_default(self, template_id: int, event_type: str) -> bool:
+        """Reset a template to its default values from notification_event_types.py"""
+        config = EVENT_CONFIG.get(event_type)
+
+        # If not found, try to find a matching event by partial name match
+        if not config:
+            for event_name, event_config in EVENT_CONFIG.items():
+                if event_type in event_name or event_name in event_type:
+                    config = event_config
+                    event_type = event_name  # Update to the correct name
+                    break
+
+        if not config:
+            return False
+
+        existing = self.get_template(template_id)
+        instance_id = existing.get("instance_identifier") if existing else None
+
+        if instance_id:
+            description = get_instance_defaults(event_type).get(instance_id)
+            if description is None:
+                return False
+            template_name = build_instance_template_name(event_type, instance_id)
+        else:
+            description = config.get("description", "")
+            template_name = event_type
+
+        self.cursor.execute("""
+            UPDATE notification_templates
+            SET embed_image_url = ?, embed_thumbnail_url = ?, embed_description = ?,
+                embed_title = ?, mention_message = NULL, footer = NULL, author = NULL,
+                is_global = 1, event_type = ?, template_name = ?
+            WHERE template_id = ?
+        """, (config.get("image_url", ""), config.get("thumbnail_url", ""), description,
+              build_default_embed_title(config), event_type, template_name, template_id))
+        self.conn.commit()
+        return True
+
+    def get_templates_by_event_type(self, event_type: Optional[str] = None) -> List[Dict]:
+        """Get all templates, optionally filtered by event type"""
+        if event_type:
+            self.cursor.execute("""
+                SELECT template_id, template_name, event_type, description, notification_type,
+                       embed_title, embed_description, is_global, created_by, instance_identifier
+                FROM notification_templates
+                WHERE event_type = ?
+                ORDER BY instance_identifier IS NOT NULL, template_name ASC
+            """, (event_type,))
+        else:
+            self.cursor.execute("""
+                SELECT template_id, template_name, event_type, description, notification_type,
+                       embed_title, embed_description, is_global, created_by, instance_identifier
+                FROM notification_templates
+                ORDER BY event_type ASC, instance_identifier IS NOT NULL, template_name ASC
+            """)
+
+        results = []
+        for row in self.cursor.fetchall():
+            results.append({
+                "template_id": row[0],
+                "template_name": row[1],
+                "event_type": row[2],
+                "description": row[3],
+                "notification_type": row[4],
+                "embed_title": row[5],
+                "embed_description": row[6],
+                "is_global": row[7],
+                "created_by": row[8],
+                "instance_identifier": row[9]
+            })
+        return results
+
+    async def show_templates(self, interaction: discord.Interaction):
+        """Show templates browser directly"""
+        if not await self.check_admin(interaction):
+            return
+        templates = self.get_templates_by_event_type()
+        if not templates:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} No templates found.",
+                ephemeral=True
+            )
+            return
+        view = TemplateBrowseView(self, templates)
+        await view.show_page(interaction, 0, ephemeral=True)
+
+class TemplateBrowseView(discord.ui.View):
+    def __init__(self, cog: NotificationTemplates, templates: List[Dict], event_filter: Optional[str] = None):
+        super().__init__(timeout=menu_timeout())
+        self.cog = cog
+        self.templates = templates
+        self.event_filter = event_filter
+        self.current_page = 0
+        self.page_size = 10
+        self.total_pages = (len(templates) + self.page_size - 1) // self.page_size
+
+    async def show_page(self, interaction: discord.Interaction, page: int, ephemeral: bool = False):
+        """Display a page of templates"""
+        self.current_page = page
+        start = page * self.page_size
+        end = min(start + self.page_size, len(self.templates))
+        page_templates = self.templates[start:end]
+        title = f"{theme.documentIcon} Available Templates"
+        if self.event_filter:
+            icon = get_event_icon(self.event_filter)
+            title = f"{icon} {self.event_filter} Templates"
+        embed = discord.Embed(
+            title=title,
+            description=f"Templates define the default notification settings used by the Setup Wizard. Edit them to customize how the event notifications appear when you create them using the wizard.\n\nShowing {start + 1}-{end} of {len(self.templates)} templates",
+            color=theme.emColor1
+        )
+        for template in page_templates:
+            icon = get_event_icon(template["event_type"])
+
+            # Check if template has been customized (is_global = 0 means customized)
+            is_customized = template["is_global"] == 0
+
+            # Simple display: just event name with customization status
+            value = "✏️ Customized" if is_customized else "*Default template*"
+
+            embed.add_field(
+                name=f"{icon} {template['template_name']}",
+                value=value,
+                inline=True
+            )
+        self.clear_items()
+        if page_templates:
+            self.add_item(TemplateSelectDropdown(self.cog, page_templates))
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(
+                label="Previous",
+                emoji=f"{theme.backIcon}",
+                style=discord.ButtonStyle.secondary,
+                disabled=(page == 0),
+                row=1
+            )
+            prev_button.callback = lambda i: self.show_page(i, page - 1, ephemeral)
+            self.add_item(prev_button)
+            page_indicator = discord.ui.Button(
+                label=f"Page {page + 1}/{self.total_pages}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                row=1
+            )
+            self.add_item(page_indicator)
+            next_button = discord.ui.Button(
+                label="Next",
+                emoji=f"{theme.forwardIcon}",
+                style=discord.ButtonStyle.secondary,
+                disabled=(page >= self.total_pages - 1),
+                row=1
+            )
+            next_button.callback = lambda i: self.show_page(i, page + 1, ephemeral)
+            self.add_item(next_button)
+
+        # Send message based on ephemeral flag
+        if ephemeral:
+            await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self)
+
+class TemplateSelectDropdown(discord.ui.Select):
+    def __init__(self, cog: NotificationTemplates, templates: List[Dict]):
+        self.cog = cog
+        self.templates = templates
+
+        options = []
+        for template in templates[:25]:  # Discord limit
+            icon = get_event_icon(template["event_type"])
+            options.append(discord.SelectOption(
+                label=template["template_name"],
+                value=str(template["template_id"]),
+                emoji=icon
+            ))
+
+        super().__init__(
+            placeholder="Select a template to preview...",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        template_id = int(self.values[0])
+        template = self.cog.get_template(template_id)
+
+        if not template:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Template not found.",
+                ephemeral=True
+            )
+            return
+
+        view = TemplatePreviewView(self.cog, template, self.templates)
+        await view.show_preview(interaction)
+
+class TemplateEditModal(discord.ui.Modal, title="Edit Template"):
+    def __init__(self, cog: NotificationTemplates, template: Dict):
+        super().__init__()
+        self.cog = cog
+        self.template = template
+
+        # Add input fields with current values
+        self.title_input = discord.ui.TextInput(
+            label="Embed Title",
+            placeholder="Enter notification title...",
+            default=template.get("embed_title", ""),
+            max_length=256,
+            required=True
+        )
+        self.add_item(self.title_input)
+
+        self.description_input = discord.ui.TextInput(
+            label="Embed Description",
+            placeholder="Enter notification description...",
+            default=template.get("embed_description", ""),
+            style=discord.TextStyle.paragraph,
+            max_length=4000,
+            required=False
+        )
+        self.add_item(self.description_input)
+
+        self.image_url_input = discord.ui.TextInput(
+            label="Image URL",
+            placeholder="https://example.com/image.png",
+            default=template.get("embed_image_url", ""),
+            max_length=512,
+            required=False
+        )
+        self.add_item(self.image_url_input)
+
+        self.thumbnail_url_input = discord.ui.TextInput(
+            label="Thumbnail URL",
+            placeholder="https://example.com/thumbnail.png",
+            default=template.get("embed_thumbnail_url", ""),
+            max_length=512,
+            required=False
+        )
+        self.add_item(self.thumbnail_url_input)
+
+        self.mention_message_input = discord.ui.TextInput(
+            label="Mention Message (Optional)",
+            placeholder="Use {tag} for mention, %t for time, %n for name, %e for event time",
+            default=template.get("mention_message", ""),
+            style=discord.TextStyle.paragraph,
+            max_length=2000,
+            required=False
+        )
+        self.add_item(self.mention_message_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle template update"""
+        try:
+            self.cog.update_template(
+                self.template["template_id"],
+                self.title_input.value,
+                self.description_input.value,
+                self.image_url_input.value or None,
+                self.thumbnail_url_input.value or None,
+                self.mention_message_input.value or None,
+                None,  # footer - not in UI yet, future use
+                None,  # author - not in UI yet, future use
+                interaction.user.id
+            )
+
+            # Refresh the template data
+            updated_template = self.cog.get_template(self.template["template_id"])
+            if not updated_template:
+                await interaction.response.send_message(
+                    f"{theme.deniedIcon} Failed to refresh template preview",
+                    ephemeral=True
+                )
+                return
+
+            # Show updated preview
+            view = TemplatePreviewView(self.cog, updated_template)
+            await view.show_preview(interaction)
+            await self._offer_apply_to_sub_events(interaction, updated_template)
+        except Exception as e:
+            logger.error(f"Error updating template: {e}")
+            print(f"Error updating template: {e}")
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Failed to update template: {str(e)}",
+                ephemeral=True
+            )
+
+    async def _offer_apply_to_sub_events(self, interaction: discord.Interaction, template: Dict):
+        """Ask whether the saved description should replace every sub-event's own wording"""
+        if template.get("instance_identifier"):
+            return
+
+        labels = get_instance_labels(template["event_type"])
+        if not labels:
+            return
+
+        event_name = template["event_type"]
+        embed = discord.Embed(
+            title=f"{theme.warnIcon} Use this text for every part of the event?",
+            description=(
+                f"**{event_name}** sends a separate notification for each part of the event: "
+                f"{', '.join(labels)}. Each part has its own wording, so the description you just "
+                "saved does not reach them yet.\n\n"
+                f"{theme.verifiedIcon} **Use for all parts** gives all of them the description you "
+                "just saved.\n"
+                f"{theme.prevIcon} **Keep their own wording** changes nothing else, and you can still "
+                "edit each part on its own from the template list.\n\n"
+                "Only the description is copied. Titles, images and mentions stay as they are."
+            ),
+            color=theme.emColor1
+        )
+
+        try:
+            await interaction.followup.send(
+                embed=embed,
+                view=ApplyDescriptionView(self.cog, template, labels),
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error offering sub-event apply for {event_name}: {e}")
+            print(f"Error offering sub-event apply for {event_name}: {e}")
+
+class ApplyDescriptionView(discord.ui.View):
+    """Confirmation for copying a template's description onto its sub-event templates"""
+
+    def __init__(self, cog: NotificationTemplates, template: Dict, labels: List[str]):
+        super().__init__(timeout=confirm_timeout())
+        self.cog = cog
+        self.template = template
+        self.labels = labels
+
+    @discord.ui.button(label="Use for all parts", emoji=f"{theme.verifiedIcon}",
+                       style=discord.ButtonStyle.primary)
+    async def confirm_apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        event_name = self.template["event_type"]
+        try:
+            updated = self.cog.apply_description_to_instances(
+                event_name,
+                self.template["embed_description"],
+                interaction.user.id
+            )
+        except Exception as e:
+            logger.error(f"Error applying description to sub-events of {event_name}: {e}")
+            print(f"Error applying description to sub-events of {event_name}: {e}")
+            await interaction.response.edit_message(
+                content=None,
+                embed=discord.Embed(
+                    title=f"{theme.deniedIcon} Could not update the other parts",
+                    description=f"Nothing was changed. The error was: {e}",
+                    color=theme.emColor3
+                ),
+                view=None
+            )
+            self.stop()
+            return
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=discord.Embed(
+                title=f"{theme.verifiedIcon} All {updated} parts updated",
+                description=f"{', '.join(self.labels)} now use the same description as **{event_name}**.",
+                color=theme.emColor1
+            ),
+            view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="Keep their own wording", emoji=f"{theme.prevIcon}",
+                       style=discord.ButtonStyle.secondary)
+    async def cancel_apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await interaction.delete_original_response()
+        self.stop()
+
+class TemplatePreviewView(discord.ui.View):
+    def __init__(self, cog: NotificationTemplates, template: Dict, all_templates: List[Dict] = None):
+        super().__init__(timeout=menu_timeout())
+        self.cog = cog
+        self.template = template
+        self.all_templates = all_templates or []
+
+    async def show_preview(self, interaction: discord.Interaction):
+        """Show preview of template"""
+        template = self.template
+
+        # Create preview embed based on template
+        icon = get_event_icon(template["event_type"])
+
+        info_embed = discord.Embed(
+            title=f"{icon} Template Preview: {template['template_name']}",
+            description=template["description"],
+            color=theme.emColor3
+        )
+
+        info_embed.add_field(
+            name="Event Type",
+            value=template["event_type"],
+            inline=True
+        )
+
+        info_embed.add_field(
+            name="Notification Type",
+            value=f"Type {template['notification_type']}",
+            inline=True
+        )
+
+        if template["repeat_config"]:
+            try:
+                repeat_data = json.loads(template["repeat_config"])
+                repeat_type = repeat_data.get("type", "custom")
+                if repeat_type == "interval":
+                    minutes = repeat_data.get("minutes", 0)
+                    if minutes >= 1440:
+                        days = minutes // 1440
+                        info_embed.add_field(
+                            name="Repeat",
+                            value=f"Every {days} day(s)",
+                            inline=True
+                        )
+                    else:
+                        info_embed.add_field(
+                            name="Repeat",
+                            value=f"Every {minutes} minutes",
+                            inline=True
+                        )
+                elif repeat_type == "fixed_days":
+                    days = repeat_data.get("days", [])
+                    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                    day_str = ", ".join([day_names[d] for d in days])
+                    info_embed.add_field(
+                        name="Repeat",
+                        value=day_str,
+                        inline=True
+                    )
+                else:
+                    info_embed.add_field(
+                        name="Repeat",
+                        value="Custom",
+                        inline=True
+                    )
+            except Exception:
+                pass
+
+        info_embed.add_field(
+            name="How to Use",
+            value="This template will be automatically applied by the **Setup Wizard**.",
+            inline=False
+        )
+
+        # Create notification preview embed with sample placeholder values
+        event_config = get_event_config(template["event_type"])
+        sample_emoji = event_config.get("emoji", "📅") if event_config else "📅"
+        sample_time = "14:00"
+        sample_date = "Nov 29"
+        sample_countdown = "10 minutes"
+
+        def replace_placeholders(text):
+            if not text:
+                return text
+            return (text.replace("%i", sample_emoji)
+                       .replace("%n", template["event_type"])
+                       .replace("%e", sample_time)
+                       .replace("%d", sample_date)
+                       .replace("%t", sample_countdown)
+                       .replace("{tag}", "@Role")
+                       .replace("@tag", "@Role"))
+
+        preview_title = replace_placeholders(template["embed_title"] or "Notification")
+        preview_desc = replace_placeholders(template["embed_description"] or "No description")
+
+        notification_embed = discord.Embed(
+            title=preview_title,
+            description=preview_desc,
+            color=int(template["embed_color"]) if template["embed_color"] else discord.Color.blue().value
+        )
+
+        if template["embed_image_url"]:
+            notification_embed.set_image(url=template["embed_image_url"])
+
+        if template["embed_thumbnail_url"]:
+            notification_embed.set_thumbnail(url=template["embed_thumbnail_url"])
+
+        if template.get("footer"):
+            notification_embed.set_footer(text=replace_placeholders(template["footer"]))
+
+        if template.get("author"):
+            notification_embed.set_author(name=replace_placeholders(template["author"]))
+
+        if template.get("mention_message"):
+            info_embed.add_field(
+                name="Mention Message",
+                value=f"`{replace_placeholders(template['mention_message'])}`",
+                inline=False
+            )
+
+        # Add edit button
+        edit_button = discord.ui.Button(
+            label="Edit Template",
+            emoji=f"{theme.editListIcon}",
+            style=discord.ButtonStyle.primary
+        )
+        edit_button.callback = self.edit_template
+        self.add_item(edit_button)
+
+        # Add reset to default button (only show if template is customized)
+        if template.get("is_global") == 0:
+            reset_button = discord.ui.Button(
+                label="Reset to Default",
+                emoji=f"{theme.refreshIcon}",
+                style=discord.ButtonStyle.danger
+            )
+            reset_button.callback = self.reset_to_default
+            self.add_item(reset_button)
+
+        # Add back button
+        back_button = discord.ui.Button(
+            label="Back",
+            emoji=f"{theme.prevIcon}",
+            style=discord.ButtonStyle.secondary
+        )
+        back_button.callback = self.back_to_browse
+        self.add_item(back_button)
+
+        await interaction.response.edit_message(embeds=[info_embed, notification_embed], view=self)
+
+    async def edit_template(self, interaction: discord.Interaction):
+        """Show template edit modal"""
+        modal = TemplateEditModal(self.cog, self.template)
+        await interaction.response.send_modal(modal)
+
+    async def reset_to_default(self, interaction: discord.Interaction):
+        """Show reset confirmation"""
+        confirm_view = ResetConfirmView(self.cog, self.template, self.all_templates)
+        await interaction.response.send_message(
+            f"{theme.warnIcon} **Reset Template to Default?**\n\n"
+            "This will restore the original image, thumbnail, title, and description from the system defaults.\n\n"
+            "Any customizations you made will be lost.",
+            view=confirm_view,
+            ephemeral=True
+        )
+
+    async def back_to_browse(self, interaction: discord.Interaction):
+        """Return to template browser"""
+        # Always fetch fresh data from database
+        templates = self.cog.get_templates_by_event_type()
+        view = TemplateBrowseView(self.cog, templates)
+        await view.show_page(interaction, 0)
+
+class ResetConfirmView(discord.ui.View):
+    """Confirmation view for resetting a template to default"""
+
+    def __init__(self, cog: NotificationTemplates, template: Dict, all_templates: List[Dict] = None):
+        super().__init__(timeout=confirm_timeout())
+        self.cog = cog
+        self.template = template
+        self.all_templates = all_templates or []
+
+    @discord.ui.button(label="Yes, Reset", style=discord.ButtonStyle.danger)
+    async def confirm_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        success = self.cog.reset_template_to_default(
+            self.template["template_id"],
+            self.template["event_type"]
+        )
+        if success:
+            await interaction.response.edit_message(
+                content=f"{theme.verifiedIcon} Template has been reset to default values.",
+                view=None
+            )
+        else:
+            await interaction.response.edit_message(
+                content=f"{theme.deniedIcon} Could not find default values for this event type.",
+                view=None
+            )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Reset cancelled.",
+            view=None
+        )
+        self.stop()
+
+async def setup(bot):
+    await bot.add_cog(NotificationTemplates(bot))

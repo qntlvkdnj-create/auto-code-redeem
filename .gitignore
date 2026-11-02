@@ -1,0 +1,13 @@
+__pycache__
+db
+db.bak
+log
+bot_token.txt
+version
+.python-version
+*venv*
+backups
+captcha_images
+.vscode
+CLAUDE.md
+tests/sim/gallery/

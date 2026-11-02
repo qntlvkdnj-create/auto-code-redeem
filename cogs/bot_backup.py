@@ -1,0 +1,935 @@
+"""
+Database backup and restore system. Manages scheduled and manual backups.
+"""
+import discord
+from discord.ext import commands, tasks
+import sqlite3
+from contextlib import closing
+import os
+import zipfile
+import datetime
+import tempfile
+import pyzipper
+import shutil
+import traceback
+import logging
+import asyncio
+from .permission_handler import PermissionManager
+from .pimp_my_bot import theme, menu_timeout, confirm_timeout
+from .bot_backup_import import show_import_menu
+
+logger = logging.getLogger('bot')
+
+class BackupOperations(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.db_path = "db/backup.sqlite"
+        self.backup_dir = "backups"
+        self.log_path = "log/backuplog.txt"
+        os.makedirs("log", exist_ok=True)
+        os.makedirs(self.backup_dir, exist_ok=True)
+        self.setup_database()
+        self.automatic_backup_loop.start()
+
+    DEFAULT_SETTINGS = {
+        'auto_enabled': 1,
+        'auto_interval_hours': 3,
+        'keep_automatic': 2,
+        'keep_manual': 5,
+    }
+
+    def setup_database(self):
+        os.makedirs("db", exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backup_passwords (
+                discord_id TEXT PRIMARY KEY,
+                backup_password TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backup_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                auto_enabled INTEGER NOT NULL DEFAULT 1,
+                auto_interval_hours INTEGER NOT NULL DEFAULT 3,
+                keep_automatic INTEGER NOT NULL DEFAULT 2,
+                keep_manual INTEGER NOT NULL DEFAULT 5,
+                last_auto_backup_at TEXT
+            )
+        ''')
+        cursor.execute('''
+            INSERT OR IGNORE INTO backup_settings (id) VALUES (1)
+        ''')
+
+        conn.commit()
+        conn.close()
+
+    def get_settings(self) -> dict:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM backup_settings WHERE id = 1").fetchone()
+        if not row:
+            return dict(self.DEFAULT_SETTINGS, last_auto_backup_at=None)
+        return dict(row)
+
+    def update_settings(self, **kwargs) -> None:
+        if not kwargs:
+            return
+        cols = ", ".join(f"{k} = ?" for k in kwargs)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                f"UPDATE backup_settings SET {cols} WHERE id = 1",
+                list(kwargs.values()),
+            )
+            conn.commit()
+
+    async def cog_unload(self):
+        self.automatic_backup_loop.cancel()
+
+    def get_disk_space_info(self):
+        """Get disk space information in MB"""
+        try:
+            # Get disk usage for the current directory
+            total, used, free = shutil.disk_usage(".")
+            return {
+                'total_mb': total / (1024 * 1024),
+                'used_mb': used / (1024 * 1024),
+                'free_mb': free / (1024 * 1024)
+            }
+        except Exception as e:
+            logger.error(f"Error getting disk space: {e}")
+            print(f"Error getting disk space: {e}")
+            return None
+
+    def estimate_backup_size(self):
+        """Estimate the size of a backup in MB"""
+        try:
+            total_size = 0
+            for file in os.listdir("db"):
+                if file.endswith(".sqlite"):
+                    file_path = os.path.join("db", file)
+                    total_size += os.path.getsize(file_path)
+            
+            estimated_compressed = total_size * 1.2 # 20% overhead for compression and packaging
+            return estimated_compressed / (1024 * 1024)
+        except Exception as e:
+            logger.error(f"Error estimating backup size: {e}")
+            print(f"Error estimating backup size: {e}")
+            return 50  # Conservative default of 50MB
+
+    def can_create_backup(self, save_locally=True):
+        """Check if we have enough space to create a backup"""
+        space_info = self.get_disk_space_info()
+        if not space_info:
+            return False, "Cannot determine disk space"
+        
+        estimated_size = self.estimate_backup_size()
+        
+        if save_locally:
+            required_space = estimated_size + 50  # 50MB buffer for local saves
+        else:
+            required_space = estimated_size + 10  # 10MB buffer for DM sends (backup deleted after send)
+        
+        if space_info['free_mb'] < required_space:
+            return False, f"Insufficient disk space. Need {required_space:.1f}MB, have {space_info['free_mb']:.1f}MB"
+        
+        if not save_locally and estimated_size > 24: # Check if backup would exceed Discord's 25MB limit for DM
+            return False, f"Backup too large for Discord ({estimated_size:.1f}MB > 24MB limit)"
+        
+        return True, "OK"
+
+    def log_backup(self, admin_id: str, success: bool, backup_type: str, method: str, filename: str = None, error_message: str = None):
+        try:
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            log_message = f"[{timestamp}] "
+            log_message += f"Type: {backup_type} | Method: {method} | "
+            log_message += f"Admin ID: {admin_id} | "
+            log_message += f"Status: {theme.verifiedIcon + ' Success' if success else theme.deniedIcon + ' Failed'}"
+            if filename:
+                log_message += f" | File: {filename}"
+            if error_message:
+                log_message += f" | Error: {error_message}"
+            log_message += "\n"
+            log_message += f"{theme.upperDivider}\n"
+
+            with open(self.log_path, 'a', encoding='utf-8') as log_file:
+                log_file.write(log_message)
+        except Exception as e:
+            logger.error(f"Logging error: {e}")
+            print(f"Logging error: {e}")
+
+    @tasks.loop(minutes=5)
+    async def automatic_backup_loop(self):
+        try:
+            settings = self.get_settings()
+            if not settings.get('auto_enabled'):
+                return
+
+            interval_hours = max(1, int(settings.get('auto_interval_hours') or 3))
+            last_at = settings.get('last_auto_backup_at')
+            if last_at:
+                try:
+                    last_dt = datetime.datetime.fromisoformat(last_at)
+                    if datetime.datetime.utcnow() - last_dt < datetime.timedelta(hours=interval_hours):
+                        return
+                except ValueError:
+                    pass
+
+            with closing(sqlite3.connect("db/settings.sqlite")) as conn, conn:
+                global_admins = conn.execute(
+                    "SELECT id FROM admin WHERE is_initial = 1"
+                ).fetchall()
+
+            can_backup, reason = self.can_create_backup(save_locally=True)
+            if not can_backup:
+                logger.info(f"Automatic backup skipped: {reason}")
+                for admin_id in global_admins:
+                    self.log_backup(str(admin_id[0]), False, "Automatic Backup", "Local", None, reason)
+                return
+
+            keep = max(1, int(settings.get('keep_automatic') or 2))
+            # One backup per cycle, attributed to the first global admin (for their password).
+            owner_id = str(global_admins[0][0]) if global_admins else "system"
+            try:
+                filename = await self.create_backup(owner_id, "Automatic", save_locally=True)
+                if filename:
+                    self.log_backup(owner_id, True, "Automatic Backup", "Local", filename)
+                    await self.cleanup_old_backups("automatic", keep=keep)
+                else:
+                    self.log_backup(owner_id, False, "Automatic Backup", "Local", None, "Backup creation failed")
+            except Exception as e:
+                self.log_backup(owner_id, False, "Automatic Backup", "Local", None, str(e))
+
+            self.update_settings(last_auto_backup_at=datetime.datetime.utcnow().isoformat())
+
+        except Exception as e:
+            logger.error(f"Automatic backup error: {e}")
+            print(f"Automatic backup error: {e}")
+
+    @automatic_backup_loop.before_loop
+    async def before_automatic_backup(self):
+        await self.bot.wait_until_ready()
+
+    async def show_backup_menu(self, interaction: discord.Interaction):
+        is_admin, is_global = PermissionManager.is_admin(interaction.user.id)
+        if not is_admin or not is_global:
+            await interaction.response.send_message(f"{theme.deniedIcon} This menu is only available for Global Admins!", ephemeral=True)
+            return
+
+        space_info = self.get_disk_space_info()
+        estimated_backup_size = self.estimate_backup_size()
+        backup_files = self.get_backup_files()
+        settings = self.get_settings()
+
+        free_line = (
+            f"{theme.saveIcon} **Free Space:** {space_info['free_mb']:.1f} MB"
+            if space_info else
+            f"{theme.saveIcon} **Free Space:** Unknown"
+        )
+        if settings.get('auto_enabled'):
+            auto_line = (
+                f"{theme.alarmClockIcon} **Auto Backup:** Every "
+                f"{settings.get('auto_interval_hours', 3)} hour(s) "
+                f"· keep last {settings.get('keep_automatic', 2)}"
+            )
+        else:
+            auto_line = f"{theme.alarmClockIcon} **Auto Backup:** Disabled"
+
+        embed = discord.Embed(
+            title=f"{theme.saveIcon} Backup System",
+            description=(
+                f"**System Status**\n"
+                f"{theme.upperDivider}\n"
+                f"{free_line}\n"
+                f"{theme.chartIcon} **Estimated Backup Size:** {estimated_backup_size:.1f} MB\n"
+                f"{theme.documentIcon} **Local Backups:** {len(backup_files)} files\n"
+                f"{auto_line}\n"
+                f"{theme.lowerDivider}\n\n"
+                f"**Available Operations**\n"
+                f"{theme.upperDivider}\n"
+                f"{theme.lockIcon} **Set Password**\n"
+                f"└ Encrypt future backups with a password\n\n"
+                f"{theme.saveIcon} **Create Backup**\n"
+                f"└ Make a backup now via DM or local save\n\n"
+                f"{theme.settingsIcon} **Auto Backup Settings**\n"
+                f"└ Schedule automatic backups and retention\n\n"
+                f"{theme.listIcon} **View Local Backups**\n"
+                f"└ List and clean up saved backup files\n\n"
+                f"{theme.importIcon} **Import from JS Bot**\n"
+                f"└ Bring alliances, members, and gift data over from the JS bot\n"
+                f"{theme.lowerDivider}"
+            ),
+            color=theme.emColor1,
+        )
+
+        if space_info and space_info['free_mb'] < 100:
+            embed.add_field(
+                name=f"{theme.warnIcon} Low Disk Space Warning",
+                value=f"Only {space_info['free_mb']:.1f} MB free. Consider cleaning old backups.",
+                inline=False,
+            )
+
+        await interaction.response.edit_message(embed=embed, view=BackupView(self))
+
+    def get_backup_files(self):
+        """Get list of all local backup files"""
+        backup_files = []
+        try:
+            for file in os.listdir(self.backup_dir):
+                if file.endswith('.zip'):
+                    backup_files.append(os.path.join(self.backup_dir, file))
+        except Exception:
+            pass
+        return sorted(backup_files, key=os.path.getmtime, reverse=True)
+
+    def _snapshot_dbs(self, dest_dir):
+        """Snapshot every db/*.sqlite into dest_dir via SQLite's online backup API (WAL-safe)."""
+        for f in os.listdir("db"):
+            if f.endswith(".sqlite"):
+                src = sqlite3.connect(os.path.join("db", f), timeout=30.0)
+                try:
+                    dst = sqlite3.connect(os.path.join(dest_dir, f))
+                    try:
+                        src.backup(dst)
+                    finally:
+                        dst.close()
+                finally:
+                    src.close()
+
+    def _write_db_zip(self, filepath, password, readme_content):
+        """Zip snapshots of all db/*.sqlite + README (AES-LZMA if password, else DEFLATED). Sync — use to_thread."""
+        with tempfile.TemporaryDirectory() as snap_dir:
+            self._snapshot_dbs(snap_dir)
+            names = sorted(f for f in os.listdir(snap_dir) if f.endswith(".sqlite"))
+            if password:
+                with pyzipper.AESZipFile(filepath, 'w', compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
+                    zf.setpassword(password.encode())
+                    for f in names:
+                        zf.write(os.path.join(snap_dir, f), f)
+                    zf.writestr("README.txt", readme_content)
+            else:
+                with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for f in names:
+                        zf.write(os.path.join(snap_dir, f), f)
+                    zf.writestr("README.txt", readme_content)
+
+    async def create_backup(self, user_id: str, backup_type: str = "Manual", save_locally: bool = True):
+        try:
+            # Get password
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT backup_password FROM backup_passwords WHERE discord_id = ?", (user_id,))
+            password_result = cursor.fetchone()
+            conn.close()
+
+            backup_password = password_result[0] if password_result else None
+
+            timestamp = datetime.datetime.now()
+            backup_name = f"{backup_type.lower()}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+
+            if save_locally:
+                # Save to local backups folder
+                filename = f"{backup_name}_encrypted.zip" if backup_password else f"{backup_name}.zip"
+                filepath = os.path.join(self.backup_dir, filename)
+                enc_line = "Encryption: AES (Password Protected)\n" if backup_password else ""
+                extract_pw = " using your backup password" if backup_password else ""
+                readme_content = (
+                    "Local Backup\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Created: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"User ID: {user_id}\n"
+                    f"Type: {backup_type}\n"
+                    "Contains: All SQLite database files\n"
+                    f"{enc_line}"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "To restore:\n"
+                    f"1. Extract this ZIP file{extract_pw}\n"
+                    "2. Replace your db/ folder contents with these files\n"
+                    "3. Restart the bot\n\n"
+                    f"{theme.robotIcon} WOS Discord Bot Backup System\n"
+                )
+                await asyncio.to_thread(self._write_db_zip, filepath, backup_password, readme_content)
+                return filename
+            
+            else:
+                # Send via DM - create temporary file
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    filename = f"{backup_name}_encrypted.zip" if backup_password else f"{backup_name}.zip"
+                    temp_filepath = os.path.join(temp_dir, filename)
+                    enc_line = "Encryption: AES (Password Protected)\n" if backup_password else ""
+                    extract_pw = " using your backup password" if backup_password else ""
+                    readme_content = (
+                        "Discord Backup\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Created: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"User ID: {user_id}\n"
+                        f"Type: {backup_type}\n"
+                        "Contains: All SQLite database files\n"
+                        f"{enc_line}"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "To restore:\n"
+                        f"1. Extract this ZIP file{extract_pw}\n"
+                        "2. Replace your db/ folder contents with these files\n"
+                        "3. Restart the bot\n\n"
+                        "⚠️ This backup expires in 30 days from Discord\n\n"
+                        f"{theme.robotIcon} WOS Discord Bot Backup System\n"
+                    )
+                    await asyncio.to_thread(self._write_db_zip, temp_filepath, backup_password, readme_content)
+                    
+                    # Check file size before sending
+                    file_size = os.path.getsize(temp_filepath)
+                    if file_size > 24 * 1024 * 1024:
+                        return None
+                    
+                    try: # Send to user via DM
+                        user = await self.bot.fetch_user(int(user_id))
+                        dm_channel = user.dm_channel or await user.create_dm()
+                        
+                        embed = discord.Embed(
+                            title=f"{theme.saveIcon} Database Backup",
+                            description=(
+                                f"**Backup Details**\n"
+                                f"{theme.upperDivider}\n"
+                                f"{theme.calendarIcon} **Created:** {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"{theme.documentIcon} **Type:** {backup_type}\n"
+                                f"{theme.shieldIcon} **Password Protected:** {'Yes' if backup_password else 'No'}\n"
+                                f"{theme.chartIcon} **File Size:** {file_size / 1024 / 1024:.2f} MB\n"
+                                f"{theme.lowerDivider}\n\n"
+                                f"{theme.warnIcon} **Important:**\n"
+                                f"• {'Use your backup password to open this file' if backup_password else 'This file is not password protected'}\n"
+                                f"• Store this file in a secure location\n"
+                                f"• This backup expires in 30 days from Discord"
+                            ),
+                            color=theme.emColor3
+                        )
+
+                        with open(temp_filepath, 'rb') as f:
+                            file = discord.File(f, filename=filename)
+                            await dm_channel.send(embed=embed, file=file)
+
+                        return filename
+
+                    except Exception as e:
+                        logger.error(f"Error sending backup via DM: {e}")
+                        print(f"Error sending backup via DM: {e}")
+                        return None
+
+        except Exception as e:
+            logger.error(f"Backup creation error: {e}")
+            print(f"Backup creation error: {e}")
+            traceback.print_exc()
+            return None
+
+    async def cleanup_old_backups(self, backup_type: str, keep: int = 2):
+        """Clean up old local backups, keeping only the most recent ones"""
+        try:
+            backup_files = []
+            for file in os.listdir(self.backup_dir):
+                if file.startswith(backup_type.lower()) and file.endswith('.zip'):
+                    filepath = os.path.join(self.backup_dir, file)
+                    backup_files.append((filepath, os.path.getmtime(filepath)))
+            
+            # Sort by modification time (newest first)
+            backup_files.sort(key=lambda x: x[1], reverse=True)
+            
+            # Remove old files
+            removed_count = 0
+            for filepath, _ in backup_files[keep:]:
+                try:
+                    os.remove(filepath)
+                    removed_count += 1
+                except Exception as e:
+                    logger.error(f"Error removing {filepath}: {e}")
+                    print(f"Error removing {filepath}: {e}")
+            
+            return removed_count
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+            print(f"Cleanup error: {e}")
+            return 0
+
+async def _global_admin_check(interaction: discord.Interaction) -> bool:
+    """Re-verify Global Admin on every click (persisted menus can be re-clicked)."""
+    _, is_global = PermissionManager.is_admin(interaction.user.id)
+    if not is_global:
+        await interaction.response.send_message(
+            f"{theme.deniedIcon} Only global admins can use this menu.", ephemeral=True
+        )
+        return False
+    return True
+
+
+class BackupView(discord.ui.View):
+    def __init__(self, cog):
+        super().__init__(timeout=menu_timeout())
+        self.cog = cog
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _global_admin_check(interaction)
+
+    @discord.ui.button(label="Set Password", emoji=f"{theme.lockIcon}", style=discord.ButtonStyle.primary, row=0)
+    async def set_password(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BackupPasswordModal(self.cog))
+
+    @discord.ui.button(label="Create Backup", emoji=f"{theme.saveIcon}", style=discord.ButtonStyle.success, row=0)
+    async def create_backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title=f"{theme.saveIcon} Create Backup",
+            description=(
+                f"Choose how you want to receive your backup:\n\n"
+                f"**{theme.messageIcon} Direct Message**\n"
+                f"• Sent to your DMs immediately\n"
+                f"• Limited to 24MB (Discord limit)\n"
+                f"• Expires in 30 days\n\n"
+                f"**{theme.saveIcon} Save Locally**\n"
+                f"• Saved to server's backup folder\n"
+                f"• No size limit (uses server storage)\n"
+                f"• Permanent until manually deleted"
+            ),
+            color=theme.emColor1,
+        )
+        await interaction.response.send_message(
+            embed=embed, view=BackupChoiceView(self.cog, interaction.user.id), ephemeral=True
+        )
+
+    @discord.ui.button(label="Auto Backup Settings", emoji=f"{theme.settingsIcon}", style=discord.ButtonStyle.primary, row=0)
+    async def settings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = BackupSettingsView(self.cog)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="View Local Backups", emoji=f"{theme.listIcon}", style=discord.ButtonStyle.primary, row=1)
+    async def view_backups(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = BackupManageView(self.cog)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="Import from JS Bot", emoji=f"{theme.importIcon}", style=discord.ButtonStyle.primary, row=1)
+    async def import_from_js(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_import_menu(self.cog, interaction)
+
+    @discord.ui.button(label="Back", emoji=f"{theme.backIcon}", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        main_menu_cog = self.cog.bot.get_cog("MainMenu")
+        if main_menu_cog:
+            await main_menu_cog.show_maintenance(interaction)
+
+class BackupChoiceView(discord.ui.View):
+    def __init__(self, cog, user_id):
+        super().__init__(timeout=confirm_timeout())
+        self.cog = cog
+        self.user_id = user_id
+
+    @discord.ui.button(label="Send to DM", emoji=f"{theme.messageIcon}", style=discord.ButtonStyle.primary)
+    async def send_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(f"{theme.deniedIcon} This is not your menu!", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if we can create DM backup
+        can_backup, reason = self.cog.can_create_backup(save_locally=False)
+        if not can_backup:
+            embed = discord.Embed(
+                title=f"{theme.deniedIcon} Cannot Create DM Backup",
+                description=reason,
+                color=theme.emColor2
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        
+        filename = await self.cog.create_backup(str(self.user_id), "Manual", save_locally=False)
+        
+        if filename:
+            embed = discord.Embed(
+                title=f"{theme.verifiedIcon} Backup Sent",
+                description=f"Backup `{filename}` has been sent to your direct messages!",
+                color=theme.emColor3
+            )
+            self.cog.log_backup(str(self.user_id), True, "Manual Backup", "DM", filename)
+        else:
+            embed = discord.Embed(
+                title=f"{theme.deniedIcon} Backup Failed",
+                description="Failed to create or send backup. Check file size and try local save instead.",
+                color=theme.emColor2
+            )
+            self.cog.log_backup(str(self.user_id), False, "Manual Backup", "DM", None, "Creation/send failed")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Save Locally", emoji=f"{theme.saveIcon}", style=discord.ButtonStyle.success)
+    async def save_local(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(f"{theme.deniedIcon} This is not your menu!", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if we can create local backup
+        can_backup, reason = self.cog.can_create_backup(save_locally=True)
+        if not can_backup:
+            embed = discord.Embed(
+                title=f"{theme.deniedIcon} Cannot Create Local Backup",
+                description=reason,
+                color=theme.emColor2
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        
+        filename = await self.cog.create_backup(str(self.user_id), "Manual", save_locally=True)
+        
+        if filename:
+            file_path = os.path.join(self.cog.backup_dir, filename)
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
+            
+            embed = discord.Embed(
+                title=f"{theme.verifiedIcon} Local Backup Created",
+                description=(
+                    f"**Backup Details:**\n"
+                    f"{theme.documentIcon} **File:** {filename}\n"
+                    f"{theme.chartIcon} **Size:** {file_size:.2f} MB\n"
+                    f"{theme.pinIcon} **Location:** `{os.path.abspath(file_path)}`\n\n"
+                    f"Use 'View Local Backups' to manage your saved backups."
+                ),
+                color=theme.emColor3
+            )
+            self.cog.log_backup(str(self.user_id), True, "Manual Backup", "Local", filename)
+        else:
+            embed = discord.Embed(
+                title=f"{theme.deniedIcon} Backup Failed",
+                description="Failed to create local backup. Check disk space and try again.",
+                color=theme.emColor2
+            )
+            self.cog.log_backup(str(self.user_id), False, "Manual Backup", "Local", None, "Creation failed")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class BackupManageView(discord.ui.View):
+    """View Local Backups page: lists files and lets the admin trim manual
+    backups beyond the configured keep count."""
+
+    def __init__(self, cog, status_note: str | None = None):
+        super().__init__(timeout=menu_timeout())
+        self.cog = cog
+        self.status_note = status_note
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _global_admin_check(interaction)
+
+    def build_embed(self) -> discord.Embed:
+        backup_files = self.cog.get_backup_files()
+        settings = self.cog.get_settings()
+        embed = discord.Embed(
+            title=f"{theme.listIcon} Local Backup Files",
+            color=theme.emColor1,
+        )
+
+        if not backup_files:
+            embed.description = (
+                f"No local backup files yet.\n\n"
+                f"Use **Create Backup** from the Backup System menu, or wait "
+                f"for the next automatic backup."
+            )
+            return embed
+
+        total_size = 0
+        for filepath in backup_files[:10]:
+            filename = os.path.basename(filepath)
+            file_size = os.path.getsize(filepath)
+            total_size += file_size
+            mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(filepath))
+            embed.add_field(
+                name=f"{theme.documentIcon} {filename}",
+                value=(
+                    f"{theme.chartIcon} {file_size / (1024 * 1024):.2f} MB\n"
+                    f"{theme.alarmClockIcon} {mod_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                ),
+                inline=True,
+            )
+
+        embed.add_field(
+            name=f"{theme.chartIcon} Summary",
+            value=(
+                f"Total shown: {total_size / (1024 * 1024):.2f} MB · "
+                f"Files: {min(len(backup_files), 10)} of {len(backup_files)}\n"
+                f"Retention: keep last **{settings.get('keep_manual', 5)}** manual · "
+                f"**{settings.get('keep_automatic', 2)}** automatic"
+            ),
+            inline=False,
+        )
+
+        if self.status_note:
+            embed.add_field(
+                name=f"{theme.verifiedIcon} Last Action",
+                value=self.status_note,
+                inline=False,
+            )
+
+        return embed
+
+    @discord.ui.button(label="Clean Old Backups", emoji=f"{theme.cleanIcon}", style=discord.ButtonStyle.secondary, row=0)
+    async def clean_backups(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = self.cog.get_settings()
+        keep_manual = max(1, int(settings.get('keep_manual') or 5))
+        keep_auto = max(1, int(settings.get('keep_automatic') or 2))
+        manual_removed = await self.cog.cleanup_old_backups("manual", keep=keep_manual)
+        auto_removed = await self.cog.cleanup_old_backups("automatic", keep=keep_auto)
+
+        if manual_removed == 0 and auto_removed == 0:
+            self.status_note = (
+                f"Already within retention limits — nothing to remove."
+            )
+        else:
+            parts = []
+            if manual_removed:
+                parts.append(f"{manual_removed} manual")
+            if auto_removed:
+                parts.append(f"{auto_removed} automatic")
+            self.status_note = f"Removed {' and '.join(parts)} backup(s)."
+
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Back", emoji=f"{theme.backIcon}", style=discord.ButtonStyle.secondary, row=0)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.show_backup_menu(interaction)
+
+
+class BackupSettingsView(discord.ui.View):
+    """Configure auto-backup behavior: on/off, interval, and how many of each
+    type to keep."""
+
+    def __init__(self, cog):
+        super().__init__(timeout=menu_timeout())
+        self.cog = cog
+        self._build_components()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _global_admin_check(interaction)
+
+    def build_embed(self) -> discord.Embed:
+        s = self.cog.get_settings()
+        last = s.get('last_auto_backup_at') or '—'
+        if last != '—':
+            try:
+                last = datetime.datetime.fromisoformat(last).strftime('%Y-%m-%d %H:%M UTC')
+            except ValueError:
+                pass
+        status = (
+            f"{theme.verifiedIcon} `enabled`" if s.get('auto_enabled')
+            else f"{theme.deniedIcon} `disabled`"
+        )
+        return discord.Embed(
+            title=f"{theme.settingsIcon} Auto Backup Settings",
+            description=(
+                f"Control how often the bot creates automatic local backups "
+                f"and how many it keeps before pruning older ones.\n\n"
+                f"{theme.upperDivider}\n"
+                f"{theme.alarmClockIcon} **Auto Backup:** {status}\n"
+                f"{theme.timeIcon} **Interval:** every "
+                f"`{s.get('auto_interval_hours', 3)}` hour(s)\n"
+                f"{theme.saveIcon} **Retention (Automatic):** keep last "
+                f"`{s.get('keep_automatic', 2)}`\n"
+                f"{theme.documentIcon} **Retention (Manual):** keep last "
+                f"`{s.get('keep_manual', 5)}`\n"
+                f"{theme.lowerDivider}\n\n"
+                f"_Last automatic backup:_ `{last}`"
+            ),
+            color=theme.emColor1,
+        )
+
+    def _build_components(self):
+        self.clear_items()
+        s = self.cog.get_settings()
+        enabled = bool(s.get('auto_enabled'))
+
+        toggle = discord.ui.Button(
+            label=f"Auto Backup: {'On' if enabled else 'Off'}",
+            emoji=f"{theme.alarmClockIcon}",
+            style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary,
+            row=0,
+        )
+        toggle.callback = self._toggle_enabled
+        self.add_item(toggle)
+
+        interval_btn = discord.ui.Button(
+            label="Edit Interval", emoji=f"{theme.timeIcon}",
+            style=discord.ButtonStyle.secondary, row=0,
+        )
+        interval_btn.callback = self._edit_interval
+        self.add_item(interval_btn)
+
+        retention_btn = discord.ui.Button(
+            label="Edit Retention", emoji=f"{theme.saveIcon}",
+            style=discord.ButtonStyle.secondary, row=0,
+        )
+        retention_btn.callback = self._edit_retention
+        self.add_item(retention_btn)
+
+        back_btn = discord.ui.Button(
+            label="Back", emoji=f"{theme.backIcon}",
+            style=discord.ButtonStyle.secondary, row=1,
+        )
+        back_btn.callback = self._back
+        self.add_item(back_btn)
+
+    async def _refresh(self, interaction: discord.Interaction):
+        self._build_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _toggle_enabled(self, interaction: discord.Interaction):
+        s = self.cog.get_settings()
+        self.cog.update_settings(auto_enabled=0 if s.get('auto_enabled') else 1)
+        await self._refresh(interaction)
+
+    async def _edit_interval(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            _BackupNumberModal(
+                self.cog, parent_view=self, field='auto_interval_hours',
+                title="Set Auto Backup Interval",
+                label="Hours between backups (1-168)",
+                default=str(self.cog.get_settings().get('auto_interval_hours', 3)),
+                min_value=1, max_value=168,
+            )
+        )
+
+    async def _edit_retention(self, interaction: discord.Interaction):
+        s = self.cog.get_settings()
+        await interaction.response.send_modal(
+            _RetentionModal(
+                self.cog, parent_view=self,
+                default_auto=str(s.get('keep_automatic', 2)),
+                default_manual=str(s.get('keep_manual', 5)),
+            )
+        )
+
+    async def _back(self, interaction: discord.Interaction):
+        await self.cog.show_backup_menu(interaction)
+
+
+class _BackupNumberModal(discord.ui.Modal):
+    """Single-field numeric modal that writes to a specific column on
+    backup_settings, then refreshes the parent view in place."""
+
+    def __init__(self, cog, parent_view, field, title, label, default,
+                 min_value: int, max_value: int):
+        super().__init__(title=title)
+        self.cog = cog
+        self.parent_view = parent_view
+        self.field = field
+        self.min_value = min_value
+        self.max_value = max_value
+        self.input = discord.ui.TextInput(
+            label=label, default=default, required=True, max_length=5,
+        )
+        self.add_item(self.input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = int(self.input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Please enter a whole number.", ephemeral=True
+            )
+            return
+        if not (self.min_value <= value <= self.max_value):
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Value must be between {self.min_value} and {self.max_value}.",
+                ephemeral=True,
+            )
+            return
+
+        self.cog.update_settings(**{self.field: value})
+        self.parent_view._build_components()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view
+        )
+
+
+class _RetentionModal(discord.ui.Modal):
+    """Two-field modal for the auto + manual retention counts. Validates both
+    before writing so a single bad value doesn't half-update the settings."""
+
+    def __init__(self, cog, parent_view, default_auto: str, default_manual: str):
+        super().__init__(title="Edit Backup Retention")
+        self.cog = cog
+        self.parent_view = parent_view
+        self.auto_input = discord.ui.TextInput(
+            label="Automatic backups to keep (1-30)",
+            default=default_auto, required=True, max_length=5,
+        )
+        self.manual_input = discord.ui.TextInput(
+            label="Manual backups to keep (1-30)",
+            default=default_manual, required=True, max_length=5,
+        )
+        self.add_item(self.auto_input)
+        self.add_item(self.manual_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            auto = int(self.auto_input.value.strip())
+            manual = int(self.manual_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Both fields must be whole numbers.", ephemeral=True
+            )
+            return
+        if not (1 <= auto <= 30) or not (1 <= manual <= 30):
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Both values must be between 1 and 30.", ephemeral=True
+            )
+            return
+
+        self.cog.update_settings(keep_automatic=auto, keep_manual=manual)
+        self.parent_view._build_components()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(), view=self.parent_view
+        )
+
+
+class BackupPasswordModal(discord.ui.Modal, title="Set Backup Password"):
+    def __init__(self, cog):
+        super().__init__()
+        self.cog = cog
+
+    password = discord.ui.TextInput(
+        label="Backup Password",
+        placeholder="Enter a secure password (leave empty to remove password)...",
+        min_length=0,
+        max_length=50,
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        password_value = self.password.value.strip()
+        
+        conn = sqlite3.connect(self.cog.db_path)
+        cursor = conn.cursor()
+        
+        if password_value:
+            cursor.execute(
+                "INSERT OR REPLACE INTO backup_passwords (discord_id, backup_password) VALUES (?, ?)",
+                (str(interaction.user.id), password_value)
+            )
+            message = "Your backup password has been saved successfully!"
+            title = f"{theme.verifiedIcon} Password Set"
+        else:
+            cursor.execute("DELETE FROM backup_passwords WHERE discord_id = ?", (str(interaction.user.id),))
+            message = "Your backup password has been removed. Future backups will not be encrypted."
+            title = f"{theme.verifiedIcon} Password Removed"
+        
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title=title,
+            description=message,
+            color=theme.emColor3
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+async def setup(bot):
+    await bot.add_cog(BackupOperations(bot))
